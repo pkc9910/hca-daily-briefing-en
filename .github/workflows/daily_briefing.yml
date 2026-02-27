@@ -2,7 +2,7 @@ name: HCA Daily Briefing
 
 on:
   schedule:
-    - cron: '45 6 * * 1-5'
+    - cron: '15 6 * * 1-5'
   workflow_dispatch:
   push:
     branches:
