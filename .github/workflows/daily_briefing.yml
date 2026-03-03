@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - main
+      - efficiency-optimizations
 
 jobs:
   generate-briefing:
