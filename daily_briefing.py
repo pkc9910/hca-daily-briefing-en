@@ -16,6 +16,7 @@ import re
 import smtplib
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -49,8 +50,7 @@ INDERES_STYLE_PROMPT_FILE = Path("inderes_style_prompt.md")
 TICKERS_CACHE_MAX_AGE_DAYS = 7
 NEWS_LOOKBACK_HOURS = 25.5
 CLAUDE_MODEL_TRIAGE = "claude-haiku-4-5-20251001"    # Fast pass: classify & rank
-CLAUDE_MODEL_ANALYSIS = "claude-sonnet-4-6"           # Deep pass: detailed summaries
-CLAUDE_MODEL_REWRITE = "claude-sonnet-4-6"            # Pass 3: Inderes-style rewrite
+CLAUDE_MODEL_ANALYSIS = "claude-sonnet-4-6"           # Deep pass: analysis + Inderes rewrite
 REQUEST_TIMEOUT = 30
 MIN_TICKER_THRESHOLD = 40  # If fewer tickers scraped, use seed list instead
 REQUEST_HEADERS = {
@@ -448,7 +448,40 @@ MARKET_INSTRUMENTS = [
     ("USDDKK=X", "USDDKK", "FX", "price"),
 ]
 
+# Patterns to auto-classify as impact 5 before Pass 1 (saves Haiku tokens)
+PREFILTER_PATTERNS = [
+    r"(?i)\bgeneral\s+meeting\b",
+    r"(?i)\bagm\b",
+    r"(?i)\bshare\s+buyback\b",
+    r"(?i)\binsider\s+transaction\b",
+    r"(?i)\bmajor\s+shareholder\b",
+    r"(?i)\bfinancial\s+calendar\b",
+    r"(?i)\bchange\s+of\s+board\b",
+    r"(?i)\bnomination\s+committee\b",
+]
+
 YAHOO_FINANCE_API_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+
+
+def _prefilter_items(news_items: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Split items into (needs_triage, auto_low_impact).
+
+    Items matching PREFILTER_PATTERNS are auto-classified as impact 5
+    and skipped from Pass 1 to save API tokens.
+    """
+    needs_triage, auto_low = [], []
+    for item in news_items:
+        headline = item.get("title", "")
+        if any(re.search(p, headline) for p in PREFILTER_PATTERNS):
+            auto_low.append(item)
+        else:
+            needs_triage.append(item)
+
+    if auto_low:
+        logger.info("Pre-filter: %d items auto-classified as low-impact, %d sent to triage.",
+                    len(auto_low), len(needs_triage))
+
+    return needs_triage, auto_low
 
 
 def _fetch_ytd_change(symbol: str, headers: dict) -> float | None:
@@ -482,75 +515,91 @@ def _fetch_ytd_change(symbol: str, headers: dict) -> float | None:
         return None
 
 
+def _fetch_single_instrument(ticker_symbol: str, display_name: str,
+                             category: str, fmt_type: str,
+                             headers: dict) -> dict:
+    """Fetch market data for a single instrument from Yahoo Finance.
+
+    Returns a dict with: name, category, format_type, price, day_change_pct, ytd_pct.
+    Always returns a result (with None values on failure).
+    """
+    try:
+        url = YAHOO_FINANCE_API_URL.format(symbol=ticker_symbol)
+        resp = requests.get(url, headers=headers, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+
+        result = data.get("chart", {}).get("result", [])
+        if result:
+            meta = result[0].get("meta", {})
+            current_price = meta.get("regularMarketPrice")
+            prev_close = meta.get("previousClose") or meta.get("chartPreviousClose")
+
+            day_change_pct = None
+            if current_price is not None and prev_close is not None and prev_close != 0:
+                day_change_pct = ((current_price - prev_close) / prev_close) * 100
+
+            ytd_pct = _fetch_ytd_change(ticker_symbol, headers)
+
+            logger.info(
+                "  %s: %s (day: %s, ytd: %s)",
+                display_name,
+                f"{current_price:.2f}" if current_price else "N/A",
+                f"{day_change_pct:.2f}%" if day_change_pct is not None else "N/A",
+                f"{ytd_pct:.2f}%" if ytd_pct is not None else "N/A",
+            )
+            return {
+                "name": display_name,
+                "category": category,
+                "format_type": fmt_type,
+                "price": current_price,
+                "day_change_pct": day_change_pct,
+                "ytd_pct": ytd_pct,
+            }
+        else:
+            logger.warning("No data returned for %s", ticker_symbol)
+
+    except Exception as exc:
+        logger.warning("Failed to fetch %s: %s", ticker_symbol, exc)
+
+    return {
+        "name": display_name,
+        "category": category,
+        "format_type": fmt_type,
+        "price": None,
+        "day_change_pct": None,
+        "ytd_pct": None,
+    }
+
+
 def fetch_market_indices() -> list[dict]:
-    """Fetch market data for all instruments from Yahoo Finance API.
+    """Fetch market data for all instruments from Yahoo Finance API in parallel.
 
     Returns list of dicts with: name, category, format_type, price, day_change_pct, ytd_pct
     """
-    logger.info("Fetching market data from Yahoo Finance...")
-    indices = []
+    logger.info("Fetching market data from Yahoo Finance (parallel)...")
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     }
 
-    for ticker_symbol, display_name, category, fmt_type in MARKET_INSTRUMENTS:
-        try:
-            url = YAHOO_FINANCE_API_URL.format(symbol=ticker_symbol)
-            resp = requests.get(url, headers=headers, timeout=10)
-            resp.raise_for_status()
-            data = resp.json()
+    # Preserve original order via index
+    results: list[tuple[int, dict]] = []
 
-            result = data.get("chart", {}).get("result", [])
-            if result:
-                meta = result[0].get("meta", {})
-                current_price = meta.get("regularMarketPrice")
-                prev_close = meta.get("previousClose") or meta.get("chartPreviousClose")
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        future_to_idx = {
+            executor.submit(
+                _fetch_single_instrument, ticker, name, cat, fmt, headers
+            ): idx
+            for idx, (ticker, name, cat, fmt) in enumerate(MARKET_INSTRUMENTS)
+        }
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            results.append((idx, future.result()))
 
-                day_change_pct = None
-                if current_price is not None and prev_close is not None and prev_close != 0:
-                    day_change_pct = ((current_price - prev_close) / prev_close) * 100
-
-                ytd_pct = _fetch_ytd_change(ticker_symbol, headers)
-
-                indices.append({
-                    "name": display_name,
-                    "category": category,
-                    "format_type": fmt_type,
-                    "price": current_price,
-                    "day_change_pct": day_change_pct,
-                    "ytd_pct": ytd_pct,
-                })
-                logger.info(
-                    "  %s: %s (day: %s, ytd: %s)",
-                    display_name,
-                    f"{current_price:.2f}" if current_price else "N/A",
-                    f"{day_change_pct:.2f}%" if day_change_pct is not None else "N/A",
-                    f"{ytd_pct:.2f}%" if ytd_pct is not None else "N/A",
-                )
-            else:
-                logger.warning("No data returned for %s", ticker_symbol)
-                indices.append({
-                    "name": display_name,
-                    "category": category,
-                    "format_type": fmt_type,
-                    "price": None,
-                    "day_change_pct": None,
-                    "ytd_pct": None,
-                })
-
-        except Exception as exc:
-            logger.warning("Failed to fetch %s: %s", ticker_symbol, exc)
-            indices.append({
-                "name": display_name,
-                "category": category,
-                "format_type": fmt_type,
-                "price": None,
-                "day_change_pct": None,
-                "ytd_pct": None,
-            })
-
-    return indices
+    # Sort by original MARKET_INSTRUMENTS order
+    results.sort(key=lambda x: x[0])
+    return [r for _, r in results]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -973,51 +1022,67 @@ NEWS ITEMS:
 
 
 def _pass2_deep_analysis(triaged_items: list[dict], items_text: str,
-                         system_prompt: str) -> dict:
-    """Pass 2 (Sonnet): Deep analysis on items with impact 1-3.
+                         system_prompt: str, inderes_style_prompt: str) -> dict:
+    """Pass 2 (Sonnet): Deep analysis + Inderes-style rewrite in a single call.
 
-    Generates detailed investor-focused summaries and the day's editorial focus.
-    Returns dict with "days_focus" and "items" (now with "summary" field added).
+    Items tagged with is_hca=True or impact=1 get Inderes morning-news style summaries.
+    Other items get standard analytical summaries.
+
+    Returns dict with "days_focus" and "items" (with "summary" and "headline" fields).
     """
     # Only send impact 1-3 items for deep analysis (skip 4-5)
     worthy_items = [i for i in triaged_items if i.get("impact", 5) <= 3]
-    skipped = [i for i in triaged_items if i.get("impact", 5) > 3]
 
     if not worthy_items:
         logger.info("Pass 2 — No items with impact 1-3, skipping deep analysis.")
         return {"days_focus": "", "items": triaged_items}
 
-    logger.info("Pass 2 — Deep analysis: sending %d items (impact 1-3) to %s …",
+    logger.info("Pass 2 — Deep analysis + Inderes rewrite: sending %d items (impact 1-3) to %s …",
                 len(worthy_items), CLAUDE_MODEL_ANALYSIS)
 
-    # Build focused text for only the worthy items
-    worthy_ids = {i["id"] for i in worthy_items}
+    # Build focused text for only the worthy items, tagged with writing style
+    worthy_ids = {i["id"]: i for i in worthy_items}
     worthy_text = ""
     for line_block in items_text.split("\n\n"):
         if not line_block.strip():
             continue
-        # Check if this block's ID is in worthy set
-        for wid in worthy_ids:
+        for wid, witem in worthy_ids.items():
             if line_block.strip().startswith(f"[{wid}]"):
-                worthy_text += line_block + "\n\n"
+                style_tag = "[INDERES]" if (witem.get("is_hca") or witem.get("impact", 5) == 1) else "[STANDARD]"
+                worthy_text += f"{style_tag} {line_block}\n\n"
                 break
+
+    inderes_count = sum(1 for i in worthy_items if i.get("is_hca") or i.get("impact", 5) == 1)
+    standard_count = len(worthy_items) - inderes_count
 
     prompt = f"""Analyse these {len(worthy_items)} important news items about companies listed on Nasdaq Copenhagen.
 They have already been classified as impact 1-3 (most significant).
 
 Write ALL output in English.
 
+## Writing Style
+
+Each news item is tagged with either [INDERES] or [STANDARD]:
+
+**[INDERES] items** ({inderes_count} items) should be written in the Inderes morning news style:
+{inderes_style_prompt}
+
+**[STANDARD] items** ({standard_count} items) should be written as standard investor analysis:
+2-3 sentence analysis in English explaining why this matters for investors.
+Include: likely impact on consensus estimates or valuation, strategic significance,
+catalyst timing and any sector read-through. Be specific and quantitative where possible.
+
 Return a JSON object with two keys:
 
-1. "days_focus": An editorial paragraph of 3-4 sentences summarising the day's most important investment themes and market-moving events. Write in a professional, analytical tone suitable for institutional investors. Identify overarching trends, sector movements and significant corporate actions. Be specific — mention company names and quantify where possible.
+1. "days_focus": An editorial paragraph of 3-4 sentences summarising the day's most important investment themes and market-moving events. Write in a professional, analytical tone suitable for institutional investors. Identify overarching trends, sector movements and significant corporate actions. Be specific — mention company names and quantify where possible. Write in the Inderes style.
 
 2. "items": An array where EACH of the {len(worthy_items)} news items has:
    - "id": the item number (must match input)
    - "ticker": ticker symbol
    - "company": company name
-   - "headline": the headline (keep as-is or clean up if needed)
+   - "headline": the headline (clean up if needed, keep concise)
    - "impact": the pre-assigned impact score (keep as-is)
-   - "summary": 2-3 sentence analysis in English explaining why this matters for investors. Include: likely impact on consensus estimates or valuation, strategic significance, catalyst timing and any sector read-through. Be specific and quantitative where possible.
+   - "summary": the summary in the relevant style (Inderes or standard) as described above
 
 Here is an example of the expected quality and style:
 {FEW_SHOT_EXAMPLE}
@@ -1055,7 +1120,10 @@ NEWS ITEMS:
     for item in triaged_items:
         iid = item["id"]
         if iid in analysed_by_id:
-            merged.append(analysed_by_id[iid])
+            ai = analysed_by_id[iid]
+            # Preserve is_hca tag from triage
+            ai["is_hca"] = item.get("is_hca", False)
+            merged.append(ai)
         else:
             # Impact 4-5: add a minimal summary from triage
             item.setdefault("summary", "Routine announcement with minimal impact for investors.")
@@ -1066,144 +1134,41 @@ NEWS ITEMS:
     return {"days_focus": days_focus, "items": merged}
 
 
-def _pass3_inderes_rewrite(top_stories: list[dict], hca_items: list[dict],
-                           days_focus: str) -> dict:
-    """Pass 3 (Sonnet): Rewrite top stories and HCA client news in Inderes style.
-
-    Takes the already-analysed items from Pass 2 and rewrites their summaries
-    in Danish Inderes morning news style. Also rewrites the days_focus editorial.
-
-    Returns dict with:
-    - "days_focus": Danish editorial paragraph
-    - "top_stories": items with rewritten summaries
-    - "hca_items": items with rewritten summaries
-    """
-    items_to_rewrite = top_stories + hca_items
-    if not items_to_rewrite:
-        logger.info("Pass 3 — No items to rewrite, skipping Inderes rewrite.")
-        return {"days_focus": days_focus, "top_stories": top_stories, "hca_items": hca_items}
-
-    logger.info("Pass 3 — Inderes rewrite: sending %d items (%d top + %d HCA) to %s …",
-                len(items_to_rewrite), len(top_stories), len(hca_items), CLAUDE_MODEL_REWRITE)
-
-    # Load Inderes style prompt as system prompt
-    inderes_prompt = _load_inderes_prompt()
-
-    # Build compact input for the rewrite
-    items_input = ""
-    for item in items_to_rewrite:
-        section = "TOP STORY" if item.get("impact", 5) == 1 else "HCA CLIENT NEWS"
-        items_input += (
-            f"[{item.get('id', '?')}] ({section}) {item.get('ticker', '')} — {item.get('company', '')}\n"
-            f"Headline: {item.get('headline', '')}\n"
-            f"Analysis: {item.get('summary', '')}\n"
-            f"Link: {item.get('link', '')}\n\n"
-        )
-
-    prompt = f"""Rewrite the following {len(items_to_rewrite)} company news items in the Inderes morning news style.
-
-You will receive news items with an analysis. Rewrite EACH news item in English in the Inderes style
-described in your instructions. Preserve all facts and key figures from the analysis.
-
-Also rewrite "days_focus" as a short English editorial summary (3-4 sentences) of the day's
-most important themes.
-
-CURRENT DAY'S FOCUS:
-{days_focus}
-
-NEWS ITEMS TO REWRITE:
-{items_input}
-
-Return a JSON object with:
-1. "days_focus": The English editorial summary
-2. "items": An array where EACH news item has:
-   - "id": the item number (keep as-is)
-   - "headline": headline in English (short and precise)
-   - "summary": The rewritten English Inderes-style news text
-
-Return ONLY the JSON object, no other text."""
-
-    client = anthropic.Anthropic()
-    message = client.messages.create(
-        model=CLAUDE_MODEL_REWRITE,
-        max_tokens=16384,
-        system=inderes_prompt,
-        messages=[{"role": "user", "content": prompt}],
-    )
-
-    response_text = message.content[0].text.strip()
-    logger.info("Pass 3 done: %d chars, input=%d output=%d tokens",
-                len(response_text),
-                message.usage.input_tokens, message.usage.output_tokens)
-
-    result = _parse_claude_json(response_text)
-
-    if isinstance(result, list):
-        rewritten_days_focus = days_focus  # keep original if parsing fails
-        rewritten_items = result
-    else:
-        rewritten_days_focus = result.get("days_focus", days_focus)
-        rewritten_items = result.get("items", [])
-
-    # Build lookup by ID for rewritten fields
-    rewritten_by_id = {i["id"]: i for i in rewritten_items}
-
-    # Apply rewritten summaries and headlines back to original items
-    rewritten_top = []
-    for item in top_stories:
-        iid = item.get("id")
-        if iid in rewritten_by_id:
-            rw = rewritten_by_id[iid]
-            if rw.get("summary"):
-                item["summary"] = rw["summary"]
-            if rw.get("headline"):
-                item["headline"] = rw["headline"]
-        rewritten_top.append(item)
-
-    rewritten_hca = []
-    for item in hca_items:
-        iid = item.get("id")
-        if iid in rewritten_by_id:
-            rw = rewritten_by_id[iid]
-            if rw.get("summary"):
-                item["summary"] = rw["summary"]
-            if rw.get("headline"):
-                item["headline"] = rw["headline"]
-        rewritten_hca.append(item)
-
-    logger.info("Pass 3 complete: %d/%d items rewritten in Inderes style.",
-                len(rewritten_by_id), len(items_to_rewrite))
-
-    return {
-        "days_focus": rewritten_days_focus,
-        "top_stories": rewritten_top,
-        "hca_items": rewritten_hca,
-    }
-
-
-def generate_briefing(news_items: list[dict]) -> dict:
+def generate_briefing(news_items: list[dict], hca_data: dict) -> dict:
     """Two-pass analysis of news items using Claude.
 
     Pass 1 (Haiku): Fast classification and impact ranking of all items.
-    Pass 2 (Sonnet): Deep investor-focused analysis of impact 1-3 items only.
+    Pass 2 (Sonnet): Deep analysis + Inderes-style rewrite in a single call.
+
+    Pre-filters obvious low-impact items before Pass 1 to save tokens.
+    Tags items with is_hca before Pass 2 so Inderes style can be applied in one call.
 
     Returns a dict with:
     - "days_focus": 3-4 sentence editorial on the day's themes
-    - "items": ranked and summarised items as a list of dicts
+    - "items": ranked and summarised items as a list of dicts (with is_hca flag)
     """
-    logger.info("Starting two-pass analysis of %d news items …", len(news_items))
+    # Pre-filter obvious low-impact items
+    to_triage, auto_low = _prefilter_items(news_items)
 
-    # Load analyst system prompt
+    logger.info("Starting analysis of %d news items (%d pre-filtered as low-impact) …",
+                len(news_items), len(auto_low))
+
+    # Load prompts
     system_prompt = _load_system_prompt()
+    inderes_style_prompt = _load_inderes_prompt()
 
-    # Build items text and metadata
-    items_text, item_metadata = _build_items_text(news_items)
+    # Build items text and metadata (only for items that need triage)
+    items_text, item_metadata = _build_items_text(to_triage)
 
     # ── Pass 1: Triage with Haiku ──
-    triaged = _pass1_triage(news_items, items_text, system_prompt)
+    triaged = _pass1_triage(to_triage, items_text, system_prompt)
 
-    # ── Pass 2: Deep analysis with Sonnet ──
-    result = _pass2_deep_analysis(triaged, items_text, system_prompt)
+    # Tag items with is_hca BEFORE Pass 2 so we can apply Inderes style in one call
+    for item in triaged:
+        item["is_hca"] = is_hca_company(item, hca_data)
+
+    # ── Pass 2: Deep analysis + Inderes rewrite with Sonnet ──
+    result = _pass2_deep_analysis(triaged, items_text, system_prompt, inderes_style_prompt)
     items = result.get("items", [])
 
     # Add link and published back from metadata
@@ -1213,10 +1178,24 @@ def generate_briefing(news_items: list[dict]) -> dict:
             item["link"] = item_metadata[item_id]["link"]
             item["published"] = item_metadata[item_id]["published"]
 
+    # Add pre-filtered items back with impact 5 and minimal summary
+    for item in auto_low:
+        items.append({
+            "id": None,
+            "ticker": item.get("ticker", "N/A"),
+            "company": item.get("company", ""),
+            "headline": item.get("title", ""),
+            "impact": 5,
+            "summary": "Routine announcement with minimal impact for investors.",
+            "link": item.get("link", ""),
+            "published": item.get("published", ""),
+            "is_hca": False,
+        })
+
     # Ensure sorted by impact
     items.sort(key=lambda x: x.get("impact", 5))
 
-    logger.info("Two-pass analysis complete: %d items scored, %d with deep analysis.",
+    logger.info("Analysis complete: %d items scored, %d with deep analysis.",
                 len(items), len([i for i in items if i.get("impact", 5) <= 3]))
 
     return {
@@ -1840,11 +1819,12 @@ def main() -> None:
             return
 
         # 4. Summarise with Claude (returns dict with days_focus and items)
-        briefing_result = generate_briefing(news_items)
+        #    Now includes pre-filtering, HCA tagging, and Inderes rewrite in one pipeline
+        briefing_result = generate_briefing(news_items, hca_data)
         days_focus = briefing_result.get("days_focus", "")
         ranked = briefing_result.get("items", [])
 
-        # 5. Organize news by new structure:
+        # 5. Organize news by structure using is_hca tag from generate_briefing:
         #    - Impact 1: Top Stories (all items)
         #    - Impact 2-3 HCA companies: HCA Client News
         #    - Impact 2-3 other: Stock News
@@ -1862,11 +1842,9 @@ def main() -> None:
                 continue
 
             if impact == 1:
-                # All impact 1 go to top stories
                 top_stories.append(item)
             elif impact in (2, 3):
-                # Impact 2-3: separate HCA vs other
-                if is_hca_company(item, hca_data):
+                if item.get("is_hca", False):
                     hca_items.append(item)
                 else:
                     other_items.append(item)
@@ -1878,16 +1856,6 @@ def main() -> None:
             len(other_items),
             len([i for i in ranked if i.get("impact", 5) >= 4]),
         )
-
-        # 5b. Pass 3: Rewrite top stories + HCA client news in Inderes style (Danish)
-        if top_stories or hca_items:
-            try:
-                rewrite_result = _pass3_inderes_rewrite(top_stories, hca_items, days_focus)
-                top_stories = rewrite_result.get("top_stories", top_stories)
-                hca_items = rewrite_result.get("hca_items", hca_items)
-                days_focus = rewrite_result.get("days_focus", days_focus)
-            except Exception as exc:
-                logger.warning("Pass 3 (Inderes rewrite) failed, using original summaries: %s", exc)
 
         # 6. Format HTML with new structure
         total_shown = len(top_stories) + len(hca_items) + len(other_items)
