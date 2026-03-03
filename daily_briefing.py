@@ -936,7 +936,7 @@ EXAMPLE OUTPUT:
       "company": "Novo Nordisk",
       "headline": "Novo Nordisk reports Q4 2025 results above consensus, raises FY2026 guidance",
       "impact": 1,
-      "summary": "Novo Nordisk delivered a strong beat with Q4 revenue up 28% YoY, driven by continued GLP-1 momentum, and operating profit 4% above consensus. The raised FY2026 guidance to DKK 290-300bn (from 275-285bn) signals management confidence in sustained demand and should drive consensus estimate upgrades of 3-5%, supporting further multiple expansion for the C25 heavyweight."
+      "summary": "Novo Nordisk this morning released its Q4 2025 results, showing revenue growth of 28% YoY driven by continued strong GLP-1 momentum. Operating profit came in 4% above consensus, confirming the company's ability to scale production in line with rising demand. The company raises its FY2026 guidance to DKK 290-300bn (from DKK 275-285bn), implying expected growth of 18-23% YoY. The upgraded outlook should drive consensus estimate revisions of 3-5% and supports further multiple expansion for the C25 heavyweight. Focus now turns to the upcoming Capital Markets Day on March 19th, where the company is expected to present updated long-term targets for the GLP-1 franchise."
     },
     {
       "id": 2,
@@ -1064,7 +1064,9 @@ Write ALL output in English.
 
 Each news item is tagged with either [INDERES] or [STANDARD]:
 
-**[INDERES] items** ({inderes_count} items) should be written in the Inderes morning news style:
+**[INDERES] items** ({inderes_count} items) should be written in the Inderes morning news style (4-10 sentences, flowing prose, NEVER bullet points).
+These items must be SIGNIFICANTLY longer and more detailed than [STANDARD] items.
+Follow this style guide:
 {inderes_style_prompt}
 
 **[STANDARD] items** ({standard_count} items) should be written as standard investor analysis:
