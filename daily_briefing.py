@@ -902,10 +902,118 @@ def _build_items_text(news_items: list[dict]) -> tuple[str, dict]:
         items_text += (
             f"[{i}] {item['ticker']} — {item['company']}\n"
             f"Headline: {item['title']}\n"
-            f"Snippet: {item['description'][:300]}\n"
+            f"Snippet: {item['description'][:2000]}\n"
             f"Date: {item['published']}\n\n"
         )
     return items_text, item_metadata
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Announcement enrichment — fetch full press release text for high-impact items
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fetch_announcement_text(url: str) -> str:
+    """Fetch the full press release text from a Nasdaq announcement URL.
+
+    Parses the HTML page and extracts the main text content.
+    Returns empty string on failure.
+    """
+    if not url:
+        return ""
+
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        logger.warning("beautifulsoup4 not installed, skipping announcement fetch.")
+        return ""
+
+    try:
+        resp = requests.get(url, headers=REQUEST_HEADERS, timeout=15)
+        resp.raise_for_status()
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # Remove script, style, nav elements
+        for tag in soup(["script", "style", "nav", "header", "footer", "noscript"]):
+            tag.decompose()
+
+        # Try to find the main content area
+        # Nasdaq view pages typically have the press release in a main content div
+        main = (
+            soup.find("div", class_=re.compile(r"body|content|message|article", re.I)) or
+            soup.find("article") or
+            soup.find("main") or
+            soup.body
+        )
+
+        if not main:
+            return ""
+
+        text = main.get_text(separator="\n", strip=True)
+
+        # Clean up excessive whitespace
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        text = "\n".join(lines)
+
+        # Cap at 5000 chars to keep token costs reasonable
+        if len(text) > 5000:
+            text = text[:5000] + "\n[…truncated]"
+
+        return text
+
+    except Exception as exc:
+        logger.debug("Failed to fetch announcement from %s: %s", url, exc)
+        return ""
+
+
+def _enrich_worthy_items(triaged_items: list[dict], item_metadata: dict) -> dict[int, str]:
+    """Fetch full announcement text for impact 1-3 items in parallel.
+
+    Returns dict mapping item ID → full announcement text.
+    """
+    worthy = [i for i in triaged_items if i.get("impact", 5) <= 3]
+    if not worthy:
+        return {}
+
+    logger.info("Enriching %d high-impact items with full announcement text…", len(worthy))
+
+    enriched: dict[int, str] = {}
+
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        future_to_id = {}
+        for item in worthy:
+            iid = item["id"]
+            link = ""
+            if iid in item_metadata:
+                link = item_metadata[iid].get("link", "")
+            if link:
+                future_to_id[executor.submit(_fetch_announcement_text, link)] = iid
+
+        for future in as_completed(future_to_id):
+            iid = future_to_id[future]
+            text = future.result()
+            if text:
+                enriched[iid] = text
+                logger.info("  Enriched item %d: %d chars of announcement text", iid, len(text))
+
+    logger.info("Enrichment complete: %d/%d items enriched.", len(enriched), len(worthy))
+    return enriched
+
+
+def _build_enriched_items_text(news_items: list[dict], item_metadata: dict,
+                                enriched_texts: dict[int, str]) -> str:
+    """Build items text with full announcement text for enriched items."""
+    items_text = ""
+    for i, item in enumerate(news_items, 1):
+        items_text += (
+            f"[{i}] {item['ticker']} — {item['company']}\n"
+            f"Headline: {item['title']}\n"
+            f"Snippet: {item['description'][:2000]}\n"
+        )
+        if i in enriched_texts:
+            items_text += f"Full Announcement:\n{enriched_texts[i]}\n"
+        items_text += f"Date: {item['published']}\n\n"
+    return items_text
 
 
 # ── Few-shot example for consistent output quality ──
@@ -1169,8 +1277,16 @@ def generate_briefing(news_items: list[dict], hca_data: dict) -> dict:
     for item in triaged:
         item["is_hca"] = is_hca_company(item, hca_data)
 
+    # ── Enrich: fetch full announcement text for impact 1-3 items ──
+    enriched_texts = _enrich_worthy_items(triaged, item_metadata)
+    if enriched_texts:
+        # Rebuild items text with full announcement content for enriched items
+        enriched_items_text = _build_enriched_items_text(to_triage, item_metadata, enriched_texts)
+    else:
+        enriched_items_text = items_text
+
     # ── Pass 2: Deep analysis + Inderes rewrite with Sonnet ──
-    result = _pass2_deep_analysis(triaged, items_text, system_prompt, inderes_style_prompt)
+    result = _pass2_deep_analysis(triaged, enriched_items_text, system_prompt, inderes_style_prompt)
     items = result.get("items", [])
 
     # Add link and published back from metadata
