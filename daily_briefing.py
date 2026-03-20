@@ -772,6 +772,15 @@ def _fetch_nasdaq_news_api(cutoff: datetime.datetime) -> list[dict]:
             if not link and item.get("cnsCode"):
                 link = f"https://www.nasdaq.com/press-release/{item.get('cnsCode')}"
 
+            # Extract PDF attachment URLs
+            attachments = item.get("attachment", [])
+            pdf_urls = [
+                att.get("attachmentUrl", "")
+                for att in (attachments if isinstance(attachments, list) else [])
+                if att.get("mimetype", "").lower() == "application/pdf"
+                and att.get("attachmentUrl")
+            ]
+
             # Only include if we have meaningful content
             if title and (company or ticker):
                 seen_titles.add(title_norm)
@@ -782,6 +791,7 @@ def _fetch_nasdaq_news_api(cutoff: datetime.datetime) -> list[dict]:
                     "description": _clean_html(description) if description else title,
                     "published": pub_date.isoformat() if pub_date else "Unknown",
                     "link": link,
+                    "pdf_urls": pdf_urls,
                 })
 
         logger.info("Nasdaq API: %d news items after filtering (cutoff: %s)",
@@ -898,6 +908,7 @@ def _build_items_text(news_items: list[dict]) -> tuple[str, dict]:
         item_metadata[i] = {
             "link": item.get("link", ""),
             "published": item.get("published", ""),
+            "pdf_urls": item.get("pdf_urls", []),
         }
         items_text += (
             f"[{i}] {item['ticker']} — {item['company']}\n"
@@ -966,38 +977,104 @@ def _fetch_announcement_text(url: str) -> str:
         return ""
 
 
-def _enrich_worthy_items(triaged_items: list[dict], item_metadata: dict) -> dict[int, str]:
-    """Fetch full announcement text for impact 1-3 items in parallel.
+def _download_pdf(url: str, max_pages: int | None = None) -> bytes | None:
+    """Download a PDF and optionally truncate to max_pages.
 
-    Returns dict mapping item ID → full announcement text.
+    Returns the (possibly truncated) PDF as bytes, or None on failure.
+    If max_pages is None, returns the full PDF.
+    """
+    if not url:
+        return None
+
+    try:
+        resp = requests.get(url, headers=REQUEST_HEADERS, timeout=30)
+        resp.raise_for_status()
+        pdf_bytes = resp.content
+
+        if max_pages is not None:
+            try:
+                import fitz  # pymupdf
+                doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+                total_pages = len(doc)
+                if total_pages > max_pages:
+                    logger.info("    Truncating PDF from %d to %d pages", total_pages, max_pages)
+                    new_doc = fitz.open()
+                    new_doc.insert_pdf(doc, from_page=0, to_page=max_pages - 1)
+                    pdf_bytes = new_doc.tobytes()
+                    new_doc.close()
+                doc.close()
+            except ImportError:
+                logger.warning("pymupdf not installed, sending full PDF without truncation.")
+            except Exception as exc:
+                logger.warning("PDF truncation failed for %s: %s — sending full PDF", url, exc)
+
+        logger.info("    Downloaded PDF: %d KB", len(pdf_bytes) // 1024)
+        return pdf_bytes
+
+    except Exception as exc:
+        logger.debug("Failed to download PDF from %s: %s", url, exc)
+        return None
+
+
+def _enrich_worthy_items(triaged_items: list[dict], item_metadata: dict) -> tuple[dict[int, str], dict[int, bytes]]:
+    """Fetch full announcement text and PDFs for impact 1-3 items in parallel.
+
+    Returns:
+    - dict mapping item ID → full announcement text
+    - dict mapping item ID → PDF bytes (for Claude document blocks)
+
+    Impact 1: full PDF (all pages)
+    Impact 2-3: first 10 pages of PDF
     """
     worthy = [i for i in triaged_items if i.get("impact", 5) <= 3]
     if not worthy:
-        return {}
+        return {}, {}
 
-    logger.info("Enriching %d high-impact items with full announcement text…", len(worthy))
+    logger.info("Enriching %d high-impact items with announcement text + PDFs…", len(worthy))
 
-    enriched: dict[int, str] = {}
+    enriched_texts: dict[int, str] = {}
+    enriched_pdfs: dict[int, bytes] = {}
 
     with ThreadPoolExecutor(max_workers=5) as executor:
-        future_to_id = {}
+        text_futures = {}
+        pdf_futures = {}
+
         for item in worthy:
             iid = item["id"]
-            link = ""
-            if iid in item_metadata:
-                link = item_metadata[iid].get("link", "")
-            if link:
-                future_to_id[executor.submit(_fetch_announcement_text, link)] = iid
+            impact = item.get("impact", 5)
+            meta = item_metadata.get(iid, {})
 
-        for future in as_completed(future_to_id):
-            iid = future_to_id[future]
+            # Fetch announcement page text
+            link = meta.get("link", "")
+            if link:
+                text_futures[executor.submit(_fetch_announcement_text, link)] = iid
+
+            # Fetch first PDF attachment if available
+            pdf_urls = meta.get("pdf_urls", [])
+            if pdf_urls:
+                # Impact 1: full PDF; Impact 2-3: first 10 pages
+                max_pages = None if impact == 1 else 10
+                pdf_futures[executor.submit(_download_pdf, pdf_urls[0], max_pages)] = iid
+
+        # Collect announcement text results
+        for future in as_completed(text_futures):
+            iid = text_futures[future]
             text = future.result()
             if text:
-                enriched[iid] = text
-                logger.info("  Enriched item %d: %d chars of announcement text", iid, len(text))
+                enriched_texts[iid] = text
+                logger.info("  Item %d: %d chars of announcement text", iid, len(text))
 
-    logger.info("Enrichment complete: %d/%d items enriched.", len(enriched), len(worthy))
-    return enriched
+        # Collect PDF results
+        for future in as_completed(pdf_futures):
+            iid = pdf_futures[future]
+            pdf_data = future.result()
+            if pdf_data:
+                enriched_pdfs[iid] = pdf_data
+                logger.info("  Item %d: PDF downloaded (%d KB)", iid, len(pdf_data) // 1024)
+
+    logger.info("Enrichment complete: %d text, %d PDFs out of %d items.",
+                len(enriched_texts), len(enriched_pdfs), len(worthy))
+    return enriched_texts, enriched_pdfs
 
 
 def _build_enriched_items_text(news_items: list[dict], item_metadata: dict,
@@ -1130,11 +1207,13 @@ NEWS ITEMS:
 
 
 def _pass2_deep_analysis(triaged_items: list[dict], items_text: str,
-                         system_prompt: str, inderes_style_prompt: str) -> dict:
+                         system_prompt: str, inderes_style_prompt: str,
+                         pdf_documents: dict[int, bytes] | None = None) -> dict:
     """Pass 2 (Sonnet): Deep analysis + Inderes-style rewrite in a single call.
 
     Items tagged with is_hca=True or impact=1 get Inderes morning-news style summaries.
     Other items get standard analytical summaries.
+    PDF documents (if any) are sent as Claude document blocks for richer analysis.
 
     Returns dict with "days_focus" and "items" (with "summary" and "headline" fields).
     """
@@ -1202,12 +1281,34 @@ Sort by impact (1 first). Return ONLY the JSON object.
 NEWS ITEMS:
 {worthy_text}"""
 
+    # Build message content: text prompt + any PDF document blocks
+    content_blocks: list[dict] = [{"type": "text", "text": prompt}]
+
+    if pdf_documents:
+        import base64
+        for item_id, pdf_bytes in pdf_documents.items():
+            item_info = next((i for i in triaged_items if i.get("id") == item_id), None)
+            company = item_info.get("company", f"item {item_id}") if item_info else f"item {item_id}"
+            content_blocks.append({
+                "type": "text",
+                "text": f"\n[Attached PDF document for {company} (item #{item_id}) — use this for deeper analysis]:",
+            })
+            content_blocks.append({
+                "type": "document",
+                "source": {
+                    "type": "base64",
+                    "media_type": "application/pdf",
+                    "data": base64.standard_b64encode(pdf_bytes).decode("ascii"),
+                },
+            })
+        logger.info("Pass 2 — Including %d PDF document(s) in API call", len(pdf_documents))
+
     client = anthropic.Anthropic()
     message = client.messages.create(
         model=CLAUDE_MODEL_ANALYSIS,
         max_tokens=16384,
         system=system_prompt,
-        messages=[{"role": "user", "content": prompt}],
+        messages=[{"role": "user", "content": content_blocks}],
     )
 
     response_text = message.content[0].text.strip()
@@ -1278,7 +1379,7 @@ def generate_briefing(news_items: list[dict], hca_data: dict) -> dict:
         item["is_hca"] = is_hca_company(item, hca_data)
 
     # ── Enrich: fetch full announcement text for impact 1-3 items ──
-    enriched_texts = _enrich_worthy_items(triaged, item_metadata)
+    enriched_texts, enriched_pdfs = _enrich_worthy_items(triaged, item_metadata)
     if enriched_texts:
         # Rebuild items text with full announcement content for enriched items
         enriched_items_text = _build_enriched_items_text(to_triage, item_metadata, enriched_texts)
@@ -1286,7 +1387,8 @@ def generate_briefing(news_items: list[dict], hca_data: dict) -> dict:
         enriched_items_text = items_text
 
     # ── Pass 2: Deep analysis + Inderes rewrite with Sonnet ──
-    result = _pass2_deep_analysis(triaged, enriched_items_text, system_prompt, inderes_style_prompt)
+    result = _pass2_deep_analysis(triaged, enriched_items_text, system_prompt, inderes_style_prompt,
+                                  pdf_documents=enriched_pdfs or None)
     items = result.get("items", [])
 
     # Add link and published back from metadata
