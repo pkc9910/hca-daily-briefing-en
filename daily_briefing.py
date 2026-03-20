@@ -1253,6 +1253,7 @@ Each news item is tagged with either [INDERES] or [STANDARD]:
 
 **[INDERES] items** ({inderes_count} items) should be written in the Inderes morning news style (4-10 sentences, flowing prose, NEVER bullet points).
 These items must be SIGNIFICANTLY longer and more detailed than [STANDARD] items.
+Split the text into 2-3 short paragraphs separated by line breaks for readability.
 Follow this style guide:
 {inderes_style_prompt}
 
@@ -1576,7 +1577,7 @@ def _format_top_story(item: dict) -> str:
           </tr>
           <tr>
             <td colspan="2" style="font-size:14px; color:#374151; line-height:1.6; padding-bottom:8px;">
-              {item.get('summary', '')}
+              {item.get('summary', '').replace(chr(10)+chr(10), '<br><br>').replace(chr(10), '<br>')}
             </td>
           </tr>
           <tr>
@@ -1627,7 +1628,7 @@ def _format_brief_item(item: dict) -> str:
           </tr>
           <tr>
             <td colspan="2" style="font-size:13px; color:#4b5563; line-height:1.5; padding-top:4px;">
-              {item.get('summary', '')[:200]}
+              {item.get('summary', '')[:200].replace(chr(10)+chr(10), '<br><br>').replace(chr(10), '<br>')}
             </td>
           </tr>
         </table>
